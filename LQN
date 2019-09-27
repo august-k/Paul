@@ -1,0 +1,202 @@
+from operator import or_
+import random
+import numpy as np
+import sc2
+from sc2 import Race, Difficulty
+from sc2.ids.ability_id import AbilityId
+from sc2.ids.unit_typeid import UnitTypeId
+from sc2.ids.upgrade_id import UpgradeId
+from sc2.position import Point2
+from sc2.player import Bot, Computer
+from sc2.data import race_townhalls
+
+
+class LQNBot(sc2.BotAI):
+    def __init__(self):
+        self.build_order_done = False
+        self.thirteen_overlord = False
+        self.nat_location = None
+        self.drone_sent = False
+        self.hatch_drone = None
+        self.hatch_started = False
+        self.real_gas = False
+        self.drones_to_gas = False
+        self.pool_started = False
+        self.nineteen_overlord = False
+        self.queen_one = False
+        self.queen_two = False
+        self.speed_started = False
+        self.defense_lings = False
+        self.lair = False
+        self.nydus_network = False
+        self.queen_three = False
+        self.main_hatch = None
+
+    def select_target(self):
+        return self.enemy_structures.random_or(self.enemy_start_locations[0]).position
+
+    def calculate_overlord_position(self, my_main, enemy_main):
+        my_x = my_main[0]
+        en_x, en_y = enemy_main[0], enemy_main[1]
+        if my_x - en_x > 0:
+            x_mod = 1
+        else:
+            x_mod = -1
+        x = en_x + (x_mod * 20)
+        location = (x, en_y)
+        return Point2(location)
+
+    async def on_step(self, iteration):
+        if iteration == 0:
+            self.main_hatch = self.townhalls[0]
+            overlord_spot = self.calculate_overlord_position(self.townhalls[0].position, self.enemy_start_locations[0])
+            nydus_spotter = self.units(UnitTypeId.OVERLORD).random
+            self.do(nydus_spotter.move(overlord_spot))
+        larvae = len(self.units(UnitTypeId.LARVA))
+        supply = self.supply_used
+
+        for queen in self.units(UnitTypeId.QUEEN).idle:
+            abilities = await self.get_available_abilities(queen)
+            if AbilityId.EFFECT_INJECTLARVA in abilities:
+                self.do(queen(
+                    AbilityId.EFFECT_INJECTLARVA, self.structures(UnitTypeId.HATCHERY).closest_to(queen.position)))
+
+        if not self.build_order_done:
+            if not self.drones_to_gas and len(self.structures(UnitTypeId.EXTRACTOR).ready) > 0:
+                group = self.workers.random_group_of(3)
+                for drone in group:
+                    drone.gather(self.structures(UnitTypeId.EXTRACTOR).closest_to(drone.position))
+                self.drones_to_gas = True
+
+            if supply == 12:
+                if self.can_afford(UnitTypeId.DRONE) and larvae > 0:
+                    self.train(UnitTypeId.DRONE)
+                    return
+
+            if not self.thirteen_overlord and supply == 13:
+                if self.can_afford(UnitTypeId.OVERLORD) and larvae > 0:
+                    self.train(UnitTypeId.OVERLORD)
+                    self.thirteen_overlord = True
+                    return
+                else:
+                    return
+
+            if self.thirteen_overlord and supply < 15:
+                if self.can_afford(UnitTypeId.DRONE) and larvae > 0:
+                    self.train(UnitTypeId.DRONE)
+                    return
+
+            if not self.drone_sent and self.minerals >= 200:
+                self.nat_location = await self.get_next_expansion()
+                self.hatch_drone = self.workers.random
+                self.do(self.hatch_drone.move(self.nat_location))
+                self.drone_sent = True
+                return
+
+            if self.drone_sent and not self.hatch_started:
+                if self.minerals >= 300:
+                    self.do(self.hatch_drone.build(UnitTypeId.HATCHERY, self.nat_location))
+                    self.hatch_started = True
+                    return
+                else:
+                    return
+
+            if self.hatch_started and not self.real_gas and supply < 16:
+                if self.can_afford(UnitTypeId.DRONE) and larvae > 0:
+                    self.train(UnitTypeId.DRONE)
+                    return
+
+            if not self.real_gas and supply == 16:
+                gas_drone = self.workers.random
+                target = self.vespene_geyser.closest_to(gas_drone.position).position
+                self.do(gas_drone.build(UnitTypeId.EXTRACTOR, target))
+                self.real_gas = True
+                return
+
+            if not self.pool_started and self.real_gas:
+                if self.can_afford(UnitTypeId.SPAWNINGPOOL):
+                    pos = self.main_hatch.position.to2.towards(self.game_info.map_center, 5)
+                    drone = self.workers.random
+                    self.do(drone.build(UnitTypeId.SPAWNINGPOOL, pos))
+                    self.pool_started = True
+
+            if self.pool_started and supply < 22:
+                if supply == 19:
+                    if larvae > 0 and self.can_afford(UnitTypeId.OVERLORD):
+                        self.train(UnitTypeId.OVERLORD)
+                        return
+                    else:
+                        return
+                if larvae > 0 and self.can_afford(UnitTypeId.DRONE):
+                    self.train(UnitTypeId.DRONE)
+                    return
+
+            if supply == 22:
+                if self.minerals >= 300:
+                    self.train(UnitTypeId.QUEEN)
+                    self.train(UnitTypeId.QUEEN)
+                    return
+                else:
+                    return
+
+            if not self.speed_started:
+                if self.can_afford(UpgradeId.ZERGLINGMOVEMENTSPEED):
+                    self.research(UpgradeId.ZERGLINGMOVEMENTSPEED)
+                    self.speed_started = True
+                    return
+                else:
+                    return
+
+            if not self.lair:
+                if self.can_afford(UnitTypeId.LAIR):
+                    self.train(UnitTypeId.LAIR)
+                    self.lair = True
+                else:
+                    if self.vespene >= 100:
+                        return
+
+            if self.lair and not self.nydus_network:
+                if self.can_afford(UnitTypeId.NYDUSNETWORK):
+                    drone = self.workers.random
+                    hatch_pos = self.main_hatch.position
+                    network_pos = Point2((hatch_pos[0]+5, hatch_pos[1]))
+                    self.do(drone.build(UnitTypeId.NYDUSNETWORK, network_pos))
+                    self.nydus_network = True
+                    self.build_order_done = True
+                    return
+
+            if self.structures(UnitTypeId.SPAWNINGPOOL).ready:
+                if self.can_afford(UnitTypeId.ZERGLING) and larvae > 0:
+                    self.train(UnitTypeId.ZERGLING)
+                    return
+                if self.can_afford(UnitTypeId.QUEEN):
+                    self.train(UnitTypeId.QUEEN)
+                    return
+
+        if self.supply_left <= 2:
+            cocoons = len(self.units(UnitTypeId.OVERLORDCOCOON))
+            if cocoons >= 0:
+                pass
+            else:
+                if larvae > 0 and self.can_afford(UnitTypeId.OVERLORD):
+                    self.train(UnitTypeId.OVERLORD)
+
+        if self.can_afford(UnitTypeId.ZERGLING) and larvae > 0:
+            self.train(UnitTypeId.ZERGLING)
+            return
+        if self.can_afford(UnitTypeId.QUEEN):
+            self.train(UnitTypeId.QUEEN)
+            return
+
+
+def main():
+    sc2.run_game(
+        sc2.maps.get("KairosJunctionLE"),
+        [Bot(Race.Zerg, LQNBot()), Computer(Race.Zerg, Difficulty.CheatInsane)],
+        realtime=False,
+        save_replay_as="/home/augustkaplan/PycharmProjects/UpdatedPySC2/LQNPart1.SC2Replay",
+    )
+
+
+if __name__ == '__main__':
+    main()
