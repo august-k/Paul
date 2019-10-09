@@ -3,16 +3,16 @@ import random
 import numpy as np
 import sc2
 from sc2 import Race, Difficulty
+from sc2.data import Alert
 from sc2.ids.ability_id import AbilityId
 from sc2.ids.unit_typeid import UnitTypeId
 from sc2.ids.upgrade_id import UpgradeId
 from sc2.position import Point2
 from sc2.player import Bot, Computer
-from sc2.data import race_townhalls
-
 
 class LQNBot(sc2.BotAI):
     def __init__(self):
+        self.rally_set = False
         self.build_order_done = False
         self.thirteen_overlord = False
         self.nat_location = None
@@ -31,6 +31,9 @@ class LQNBot(sc2.BotAI):
         self.nydus_network = False
         self.queen_three = False
         self.main_hatch = None
+        self.main_height = None
+        self.x_mod = 0
+        self.nydus_spotter = None
 
     def select_target(self):
         return self.enemy_structures.random_or(self.enemy_start_locations[0]).position
@@ -39,34 +42,47 @@ class LQNBot(sc2.BotAI):
         my_x = my_main[0]
         en_x, en_y = enemy_main[0], enemy_main[1]
         if my_x - en_x > 0:
-            x_mod = 1
+            self.x_mod = 1
         else:
-            x_mod = -1
-        x = en_x + (x_mod * 20)
+            self.x_mod = -1
+        x = en_x + (self.x_mod * 25)
         location = (x, en_y)
         return Point2(location)
 
     async def on_step(self, iteration):
         if iteration == 0:
             self.main_hatch = self.townhalls[0]
+            self.main_height = self.get_terrain_z_height(self.main_hatch.position)
             overlord_spot = self.calculate_overlord_position(self.townhalls[0].position, self.enemy_start_locations[0])
-            nydus_spotter = self.units(UnitTypeId.OVERLORD).random
-            self.do(nydus_spotter.move(overlord_spot))
+            self.nydus_spotter = self.units(UnitTypeId.OVERLORD).first
+            self.do(self.nydus_spotter.move(overlord_spot))
         larvae = len(self.units(UnitTypeId.LARVA))
         supply = self.supply_used
+
+        if not self.rally_set and len(self.townhalls) > 1:
+            for hq in self.townhalls:
+                self.do(hq(AbilityId.RALLY_HATCHERY_UNITS, self.nat_location.to2.towards(self.game_info.map_center, 5)))
+                self.rally_set = True
+
+        if self.already_pending(UnitTypeId.NYDUSNETWORK):
+            self.build_order_done = True
 
         for queen in self.units(UnitTypeId.QUEEN).idle:
             abilities = await self.get_available_abilities(queen)
             if AbilityId.EFFECT_INJECTLARVA in abilities:
                 self.do(queen(
-                    AbilityId.EFFECT_INJECTLARVA, self.structures(UnitTypeId.HATCHERY).closest_to(queen.position)))
+                    AbilityId.EFFECT_INJECTLARVA, self.townhalls.closest_to(queen.position)))
 
         if not self.build_order_done:
-            if not self.drones_to_gas and len(self.structures(UnitTypeId.EXTRACTOR).ready) > 0:
-                group = self.workers.random_group_of(3)
-                for drone in group:
-                    drone.gather(self.structures(UnitTypeId.EXTRACTOR).closest_to(drone.position))
-                self.drones_to_gas = True
+            for extract in self.gas_buildings:
+                if extract.assigned_harvesters < extract.ideal_harvesters:
+                    w = self.workers.closer_than(20, extract)
+                    if w.exists:
+                        self.do(w.random.gather(extract))
+
+            for hq in self.townhalls:
+                if hq.assigned_harvesters > hq.ideal_harvesters:
+                    await self.distribute_workers()
 
             if supply == 12:
                 if self.can_afford(UnitTypeId.DRONE) and larvae > 0:
@@ -107,11 +123,14 @@ class LQNBot(sc2.BotAI):
                     return
 
             if not self.real_gas and supply == 16:
-                gas_drone = self.workers.random
-                target = self.vespene_geyser.closest_to(gas_drone.position).position
-                self.do(gas_drone.build(UnitTypeId.EXTRACTOR, target))
-                self.real_gas = True
-                return
+                if self.can_afford(UnitTypeId.EXTRACTOR):
+                    gas_drone = self.workers.random
+                    target = self.vespene_geyser.closest_to(gas_drone.position)
+                    self.do(gas_drone.build(UnitTypeId.EXTRACTOR, target))
+                    self.real_gas = True
+                    return
+                else:
+                    return
 
             if not self.pool_started and self.real_gas:
                 if self.can_afford(UnitTypeId.SPAWNINGPOOL):
@@ -119,14 +138,16 @@ class LQNBot(sc2.BotAI):
                     drone = self.workers.random
                     self.do(drone.build(UnitTypeId.SPAWNINGPOOL, pos))
                     self.pool_started = True
+                else:
+                    return
 
             if self.pool_started and supply < 22:
                 if supply == 19:
-                    if larvae > 0 and self.can_afford(UnitTypeId.OVERLORD):
-                        self.train(UnitTypeId.OVERLORD)
-                        return
-                    else:
-                        return
+                    cocoons = self.units(UnitTypeId.OVERLORDCOCOON)
+                    if cocoons:
+                        if larvae > 0 and self.can_afford(UnitTypeId.OVERLORD):
+                            self.train(UnitTypeId.OVERLORD)
+                            return
                 if larvae > 0 and self.can_afford(UnitTypeId.DRONE):
                     self.train(UnitTypeId.DRONE)
                     return
@@ -139,62 +160,74 @@ class LQNBot(sc2.BotAI):
                 else:
                     return
 
-            if not self.speed_started:
-                if self.can_afford(UpgradeId.ZERGLINGMOVEMENTSPEED):
+            if self.already_pending_upgrade(UpgradeId.ZERGLINGMOVEMENTSPEED) == 0 and self.can_afford(
+                UpgradeId.ZERGLINGMOVEMENTSPEED
+            ):
+                spawning_pools_ready = self.structures(UnitTypeId.SPAWNINGPOOL).ready
+                if spawning_pools_ready:
                     self.research(UpgradeId.ZERGLINGMOVEMENTSPEED)
                     self.speed_started = True
                     return
-                else:
-                    return
 
-            if not self.lair:
-                if self.can_afford(UnitTypeId.LAIR):
-                    self.train(UnitTypeId.LAIR)
-                    self.lair = True
-                else:
-                    if self.vespene >= 100:
+            if not self.lair and self.speed_started:
+                if self.vespene >= 80:
+                    if self.can_afford(UnitTypeId.LAIR):
+                        for hq in self.townhalls:
+                            if hq.is_idle:
+                                self.do(hq.build(UnitTypeId.LAIR))
+                                self.lair = True
+                                return
+                    else:
                         return
 
-            if self.lair and not self.nydus_network:
-                if self.can_afford(UnitTypeId.NYDUSNETWORK):
-                    drone = self.workers.random
-                    hatch_pos = self.main_hatch.position
-                    network_pos = Point2((hatch_pos[0]+5, hatch_pos[1]))
-                    self.do(drone.build(UnitTypeId.NYDUSNETWORK, network_pos))
-                    self.nydus_network = True
-                    self.build_order_done = True
-                    return
+            if self.townhalls(UnitTypeId.LAIR).ready.exists and not self.already_pending(UnitTypeId.NYDUSNETWORK):
+                if self.vespene >= 100:
+                    if self.can_afford(UnitTypeId.NYDUSNETWORK):
+                        drone = self.workers.random
+                        hatch_pos = self.main_hatch.position
+                        for i in range(-5, -10, -1):
+                            network_pos = Point2((hatch_pos[0] + self.x_mod * i, hatch_pos[1]))
+                            self.do(drone.build(UnitTypeId.NYDUSNETWORK, network_pos))
+                    else:
+                        return
 
-            if self.structures(UnitTypeId.SPAWNINGPOOL).ready:
-                if self.can_afford(UnitTypeId.ZERGLING) and larvae > 0:
-                    self.train(UnitTypeId.ZERGLING)
-                    return
-                if self.can_afford(UnitTypeId.QUEEN):
-                    self.train(UnitTypeId.QUEEN)
-                    return
+        if self.structures(UnitTypeId.NYDUSNETWORK).ready.exists and not self.already_pending(UnitTypeId.NYDUSCANAL):
+            if self.minerals >= 50:
+                closest_ovie = self.units(UnitTypeId.OVERLORD).closest_to(self.enemy_start_locations[0].position)
+                for i in range(11):
+                    pos = closest_ovie.position.to2.towards(self.enemy_start_locations[0].position, i)
+                    #debugger is saying i is referenced before being assigned in line 200
+                    if self.get_terrain_z_height(pos) == self.main_height and self.is_visible(pos)\
+                            and self.can_place(self.structures(UnitTypeId.NYDUSCANAL)):
+                        nydus = self.structures(UnitTypeId.NYDUSNETWORK).ready[0]
+                        self.do(nydus(AbilityId.BUILD_NYDUSWORM, pos))
+                        return
+            else:
+                return
 
         if self.supply_left <= 2:
-            cocoons = len(self.units(UnitTypeId.OVERLORDCOCOON))
-            if cocoons >= 0:
+            cocoons = self.units(UnitTypeId.OVERLORDCOCOON)
+            if cocoons:
                 pass
             else:
                 if larvae > 0 and self.can_afford(UnitTypeId.OVERLORD):
                     self.train(UnitTypeId.OVERLORD)
 
-        if self.can_afford(UnitTypeId.ZERGLING) and larvae > 0:
-            self.train(UnitTypeId.ZERGLING)
-            return
-        if self.can_afford(UnitTypeId.QUEEN):
-            self.train(UnitTypeId.QUEEN)
-            return
+        if self.structures(UnitTypeId.SPAWNINGPOOL).ready.exists:
+            if self.can_afford(UnitTypeId.ZERGLING) and larvae > 0:
+                self.train(UnitTypeId.ZERGLING)
+                return
+            if self.can_afford(UnitTypeId.QUEEN) and self.build_order_done:
+                self.train(UnitTypeId.QUEEN)
+                return
 
 
 def main():
     sc2.run_game(
         sc2.maps.get("KairosJunctionLE"),
-        [Bot(Race.Zerg, LQNBot()), Computer(Race.Zerg, Difficulty.CheatInsane)],
+        [Bot(Race.Zerg, LQNBot()), Computer(Race.Zerg, Difficulty.VeryEasy)],
         realtime=False,
-        save_replay_as="/home/augustkaplan/PycharmProjects/UpdatedPySC2/LQNPart1.SC2Replay",
+        save_replay_as="LQNPart1.SC2Replay"
     )
 
 
