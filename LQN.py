@@ -1,3 +1,4 @@
+#need to clean up imports, a bunch aren't used
 from operator import or_
 import random
 import numpy as np
