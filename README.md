@@ -1,2 +1,2 @@
 # Paul
-Basic Zerg PySC2 AI
+Basic Zerg python-sc2 Bot (using BuRny's fork)
